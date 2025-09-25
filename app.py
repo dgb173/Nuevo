@@ -394,18 +394,26 @@ def parse_main_page_finished_matches(html_content, limit=20, offset=0, handicap_
 
     return paginated_matches
 
-async def get_main_page_matches_async(limit=20, offset=0, handicap_filter=None):
+async def get_main_page_matches_async(limit=20, offset=0, handicap_filter=None, return_html_for_debugging=False):
     html_content = await _fetch_nowgoal_html(filter_state=3)
     if not html_content:
         html_content = await _fetch_nowgoal_html(filter_state=3, requests_first=False)
-        if not html_content:
-            return []
+    
+    if return_html_for_debugging:
+        return html_content # Devolver solo el HTML para depurar
+
+    if not html_content:
+        return []
+
     matches = parse_main_page_matches(html_content, limit, offset, handicap_filter)
-    if not matches:
-        html_content = await _fetch_nowgoal_html(filter_state=3, requests_first=False)
-        if not html_content:
-            return []
-        matches = parse_main_page_matches(html_content, limit, offset, handicap_filter)
+    
+    # Se simplifica la lógica de reintento para facilitar la depuración
+    # if not matches:
+    #     html_content = await _fetch_nowgoal_html(filter_state=3, requests_first=False)
+    #     if not html_content:
+    #         return []
+    #     matches = parse_main_page_matches(html_content, limit, offset, handicap_filter)
+        
     return matches
 
 async def get_main_page_finished_matches_async(limit=20, offset=0, handicap_filter=None):
@@ -425,18 +433,60 @@ async def get_main_page_finished_matches_async(limit=20, offset=0, handicap_filt
 @app.route('/')
 def index():
     try:
+        import html
         print("Recibida petición para Próximos Partidos...")
         hf = request.args.get('handicap')
-        matches = asyncio.run(get_main_page_matches_async(handicap_filter=hf))
+        
+        # --- INICIO CÓDIGO DE DEPURACIÓN ---
+        # 1. Intentar obtener el HTML
+        html_content = asyncio.run(get_main_page_matches_async(return_html_for_debugging=True))
+        
+        if not html_content:
+            # Si no se puede obtener el HTML, es un problema de red/proxy
+            return """
+                <h1>Error de Obtención de Datos</h1>
+                <p>No se pudo descargar el contenido de la página de origen (Nowgoal).</p>
+                <p><strong>Posibles causas:</strong></p>
+                <ul>
+                    <li>El servicio de proxy no está funcionando, la <code>PROXY_URL</code> es incorrecta o ha caducado.</li>
+                    <li>El sitio de Nowgoal está bloqueando activamente la IP del proxy.</li>
+                    <li>Hay un problema de red temporal en el servidor de Render.</li>
+                </ul>
+                <p><strong>Acción recomendada:</strong></p>
+                <p>Por favor, revisa los logs de la aplicación en el panel de Render. Busca mensajes de error relacionados con "requests" o "Playwright" que indiquen timeouts o fallos de conexión.</p>
+            """
+
+        # 2. Intentar parsear el HTML
+        matches = parse_main_page_matches(html_content, limit=20, offset=0, handicap_filter=hf)
+        
+        if not matches:
+            # Si hay HTML pero no partidos, es un problema de parseo (la estructura de la web cambió)
+            escaped_html = html.escape(html_content)
+            return f"""
+                <h1>Error de Análisis de Datos (Scraper)</h1>
+                <p>Se ha obtenido contenido HTML de la página de Nowgoal, pero el scraper no ha podido encontrar ningún partido.</p>
+                <p><strong>Causa más probable:</strong> La estructura de la página web de Nowgoal ha cambiado y los selectores que usa el scraper (ej: <code>tr id='tr1_...'</code>) ya no son válidos.</p>
+                <p><strong>Acción recomendada:</strong></p>
+                <p>Copia el contenido HTML que se muestra a continuación y envíamelo. Con esto podré analizar la nueva estructura y actualizar el scraper.</p>
+                <hr>
+                <h2>HTML Recibido:</h2>
+                <pre style="white-space: pre-wrap; background-color: #f4f4f4; padding: 10px; border: 1px solid #ccc;">{escaped_html}</pre>
+            """
+        # --- FIN CÓDIGO DE DEPURACIÓN ---
+
+        # Si todo fue bien, mostrar la página normal
         print(f"Scraper finalizado. {len(matches)} partidos encontrados.")
         opts = sorted({
             normalize_handicap_to_half_bucket_str(m.get('handicap'))
             for m in matches if normalize_handicap_to_half_bucket_str(m.get('handicap')) is not None
         }, key=lambda x: float(x))
         return render_template('index.html', matches=matches, handicap_filter=hf, handicap_options=opts, page_mode='upcoming', page_title='Próximos Partidos')
+    
     except Exception as e:
         print(f"ERROR en la ruta principal: {e}")
-        return render_template('index.html', matches=[], error=f"No se pudieron cargar los partidos: {e}", page_mode='upcoming', page_title='Próximos Partidos')
+        import html
+        error_message = html.escape(str(e))
+        return render_template('index.html', matches=[], error=f"No se pudieron cargar los partidos: {error_message}", page_mode='upcoming', page_title='Próximos Partidos')
 
 @app.route('/resultados')
 def resultados():
