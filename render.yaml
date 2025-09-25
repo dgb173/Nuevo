@@ -4,8 +4,10 @@ services:
     env: python
     plan: free
     buildCommand: "./build.sh"
-    startCommand: "gunicorn app:app"
-    healthCheckPath: / # Render verificará la ruta principal para saber si la app está viva
+    startCommand: "gunicorn -k uvicorn.workers.UvicornWorker app:app"
+    healthCheckPath: /
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.4 # Especificar una versión de Python para consistencia
+        value: 3.11.4
+      - key: PROXY_URL
+        value: "URL_DE_TU_PROXY" # ¡¡IMPORTANTE!! Reemplaza esto con la URL de tu servicio de proxy
