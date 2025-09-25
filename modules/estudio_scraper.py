@@ -4,6 +4,7 @@ from modules.analisis_reciente import analizar_rendimiento_reciente_con_handicap
 from modules.analisis_rivales import analizar_rivales_comunes, analizar_contra_rival_del_rival
 from modules.funciones_resumen import generar_resumen_rendimiento_reciente
 from modules.funciones_auxiliares import _calcular_estadisticas_contra_rival, _analizar_over_under, _analizar_ah_cubierto, _analizar_desempeno_casa_fuera
+import os
 import time
 import re
 import math
@@ -878,6 +879,14 @@ def obtener_datos_completos_partido(match_id: str):
     options.add_argument("--disable-gpu")
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/116.0.0.0 Safari/537.36")
     options.add_argument('--blink-settings=imagesEnabled=false')
+
+    # --- INTEGRACIÓN DE PROXY PARA SELENIUM ---
+    proxy_url = os.environ.get('PROXY_URL')
+    if proxy_url:
+        options.add_argument(f'--proxy-server={proxy_url}')
+        print("[INFO] Selenium configurado para usar proxy.")
+    # ------------------------------------------
+
     driver = webdriver.Chrome(options=options)
     
     main_page_url = f"{BASE_URL_OF}/match/h2h-{match_id}"

@@ -1,8 +1,11 @@
 services:
   - type: web
-    name: app-scraper-nowgoal
+    name: nowgoal-scraper
     env: python
     plan: free
     buildCommand: "./build.sh"
     startCommand: "gunicorn app:app"
-    healthCheckPath: "/"
+    healthCheckPath: / # Render verificará la ruta principal para saber si la app está viva
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.4 # Especificar una versión de Python para consistencia

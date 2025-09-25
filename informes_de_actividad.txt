@@ -1,0 +1,93 @@
+=============================================================
+INFORME DE ACTIVIDAD: PRUEBAS DE CARGA Y BENCHMARKING
+=============================================================
+
+**Fecha:** 25 de septiembre de 2025
+
+**Objetivo:** Cuantificar el rendimiento y los requisitos de recursos (CPU, RAM) de la aplicación bajo escenarios de carga controlados. El propósito es obtener datos reales para invalidar o validar suposiciones de infraestructura y tomar decisiones de ingeniería basadas en métricas.
+
+**Resumen de Acciones:**
+1.  Se añadió la dependencia `psutil` al archivo `requirements.txt` para permitir la monitorización de recursos del sistema.
+2.  Se creó un script de pruebas automatizadas, `benchmark.py`.
+3.  Se configuró el script para usar un `match_id` específico (2824469) y para desactivar el modo `debug` de Flask, garantizando un entorno de prueba estable.
+4.  Se ejecutó el script, que a su vez lanzó la aplicación y simuló peticiones concurrentes a los endpoints críticos.
+5.  Se generó un informe tabulado con los resultados, que fue presentado.
+
+**Detalle de Cambios y Justificación:**
+-   **`requirements.txt`:** Se añadió `psutil` porque es la librería estándar en Python para acceder a información del sistema, como el uso de CPU y memoria de un proceso.
+-   **`benchmark.py`:**
+    -   **Lógica:** El script utiliza el módulo `subprocess` para lanzar la aplicación `app.py` de forma independiente. Luego, usa `threading` para enviar múltiples peticiones `requests` en paralelo, simulando usuarios concurrentes.
+    -   **Monitorización:** Un hilo separado utiliza `psutil` para observar el proceso principal de la aplicación y todos sus subprocesos hijos (los navegadores `headless` de Selenium/Playwright). Registra el uso máximo de CPU y RAM durante el período de prueba más intensivo.
+    -   **Escenarios:** Se implementaron los dos escenarios solicitados: pruebas al endpoint ligero `/api/preview` y al endpoint pesado `/api/analisis` con diferentes niveles de concurrencia.
+-   **`app.py`:** Se desactivó `debug=True` temporalmente para la prueba. Esto fue crucial porque el modo debug de Flask incluye un auto-reloader que interfería con el arranque estable del subproceso, causando timeouts en el script de benchmark.
+
+**Impacto en el Proyecto:**
+-   **Validación de Hipótesis:** Los resultados demostraron cuantitativamente que la arquitectura original de "scraping bajo demanda" era inviable, con tiempos de respuesta de ~20 segundos para una sola petición pesada.
+-   **Dimensionamiento de Infraestructura:** Se estableció un requisito base de ~110 MB de RAM por cada proceso de análisis concurrente. Este dato es fundamental y ahora guía la elección del plan de servidor.
+-   **Toma de Decisiones:** Este informe fue el catalizador para priorizar la implementación de una capa de caché como el siguiente paso lógico y obligatorio, antes de considerar cualquier despliegue.
+
+
+=============================================================
+INFORME DE ACTIVIDAD: IMPLEMENTACIÓN DE ARQUITECTURA DE CACHÉ
+=============================================================
+
+**Fecha:** 25 de septiembre de 2025
+
+**Objetivo:** Solucionar el principal cuello de botella de rendimiento de la aplicación. Implementar una capa de persistencia local para almacenar los resultados de los análisis de scraping, evitando la re-ejecución de procesos costosos para peticiones repetidas.
+
+**Resumen de Acciones:**
+1.  Se creó un nuevo módulo, `modules/cache_manager.py`, para encapsular toda la lógica de interacción con la base de datos de caché.
+2.  Se utilizó la librería `sqlite3`, nativa de Python, para la gestión de la base de datos.
+3.  Se modificó el archivo principal `app.py` para integrar la lógica de caché en las rutas que ejecutan el análisis completo.
+
+**Detalle de Cambios y Justificación:**
+-   **`modules/cache_manager.py`:**
+    -   **`setup_database()`:** Al iniciar, el módulo asegura que exista un archivo `cache.db` y una tabla `analysis_cache` con la estructura correcta (`match_id`, `data_json`, `timestamp`). Esto automatiza la inicialización.
+    -   **`get_from_cache(match_id)`:** Esta función busca un `match_id` en la base de datos. Si lo encuentra, comprueba su antigüedad (`timestamp`). Si es más reciente que el tiempo de expiración (24 horas), devuelve los datos. Si no, devuelve `None`.
+    -   **`set_to_cache(match_id, data)`:** Esta función recibe los datos de un scraping exitoso, los convierte a formato JSON y los guarda (o actualiza si ya existe) en la base de datos junto con la marca de tiempo actual.
+    -   **Elección de SQLite:** Se eligió SQLite por ser una solución sin servidor, integrada en Python, que no requiere configuración adicional, perfecta para una primera implementación de caché.
+-   **`app.py`:**
+    -   **Importación:** Se importó el nuevo `cache_manager`.
+    -   **Modificación de Rutas:** Las funciones que manejan `/estudio/<match_id>` y `/api/analisis/<match_id>` fueron reescritas para seguir el nuevo flujo:
+        1.  Llamar a `get_from_cache()`.
+        2.  **Si hay datos, retornarlos inmediatamente.**
+        3.  **Si no hay datos, ejecutar el costoso `obtener_datos_completos_partido()`**.
+        4.  Tras una ejecución exitosa, llamar a `set_to_cache()` antes de retornar los datos al usuario.
+
+**Impacto en el Proyecto:**
+-   **Rendimiento Exponencialmente Mejorado:** Para peticiones repetidas de un mismo partido, el tiempo de respuesta pasará de ~20 segundos a unos pocos milisegundos.
+-   **Reducción de Carga y Costes:** Disminuye drásticamente el uso de CPU y RAM del servidor, ya que se evitan los procesos de `Selenium`.
+-   **Menor Riesgo de Bloqueo:** Al realizar menos peticiones a la web de origen, se reduce significativamente la probabilidad de ser detectado y bloqueado.
+-   **Viabilidad del Servicio:** Este cambio transforma la aplicación de un prototipo inviable a un servicio funcional y escalable.
+
+
+=============================================================
+INFORME DE ACTIVIDAD: INTEGRACIÓN DE ESTRATEGIA ANTI-BLOQUEO
+=============================================================
+
+**Fecha:** 25 de septiembre de 2025
+
+**Objetivo:** Asegurar la viabilidad y longevidad de la aplicación mediante la ofuscación de su origen de tráfico, evitando así el bloqueo por parte del sitio web objetivo (Nowgoal).
+
+**Resumen de Acciones:**
+1.  Se realizó una investigación de mercado sobre servicios de proxy rotativos, comparando Bright Data y ScraperAPI.
+2.  Se seleccionó Bright Data como la opción más compatible con la arquitectura actual de la aplicación.
+3.  Se modificó el código en `app.py` y `modules/estudio_scraper.py` para enrutar todas las peticiones HTTP salientes a través de un servicio de proxy.
+4.  La configuración del proxy se gestiona a través de una variable de entorno (`PROXY_URL`) para mantener la seguridad y flexibilidad.
+
+**Detalle de Cambios y Justificación:**
+-   **Investigación:** El análisis concluyó que Bright Data era superior para este caso de uso porque permite la configuración directa de un proxy en herramientas de automatización de navegador como Playwright y Selenium, lo cual es un requisito del proyecto. ScraperAPI, en cambio, está más orientado a que se le delegue el scraping por completo.
+-   **`app.py` (requests):**
+    -   Se modificó la función `_get_shared_requests_session`.
+    -   Ahora, la función lee la variable de entorno `PROXY_URL`. Si existe, configura el diccionario `proxies` de la sesión de `requests` para que todas las peticiones de esa sesión pasen por el proxy.
+-   **`app.py` (Playwright):**
+    -   Se modificó la función `_fetch_nowgoal_html`.
+    -   Antes de lanzar el navegador Playwright, el código ahora lee la `PROXY_URL`, la parsea para extraer `servidor`, `usuario` y `contraseña`, y pasa estos datos al parámetro `proxy` de la función `p.chromium.launch()`.
+-   **`modules/estudio_scraper.py` (Selenium):**
+    -   Se modificó la función `obtener_datos_completos_partido`.
+    -   De manera similar a Playwright, se lee la `PROXY_URL` y se añade como un argumento de línea de comandos (`--proxy-server=...`) a las `ChromeOptions` antes de inicializar el driver de Selenium.
+
+**Impacto en el Proyecto:**
+-   **Robustez y Longevidad:** La aplicación ya no realiza peticiones desde una única IP fija de un servidor, sino que las rota a través de una red de proxies residenciales o de otro tipo. Esto hace que sea extremadamente difícil para el sitio objetivo detectar y bloquear el scraper.
+-   **Viabilidad a Largo Plazo:** Esta es una característica no negociable para cualquier proyecto de scraping serio. Sin ella, la aplicación tendría una vida útil de horas o días. Ahora, está preparada para operar de forma continua.
+-   **Profesionalización:** El código ahora sigue las mejores prácticas de la industria del web scraping, separando la configuración sensible (URL del proxy) del código fuente a través de variables de entorno.

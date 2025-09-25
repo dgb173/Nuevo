@@ -22,8 +22,10 @@ from modules.estudio_scraper import (
     parse_ah_to_number_of
 )
 from flask import jsonify # Asegúrate de que jsonify está importado
+from modules import cache_manager # IMPORTAR EL GESTOR DE CACHÉ
 
 app = Flask(__name__)
+import os
 
 # --- Mantén tu lógica para la página principal ---
 URL_NOWGOAL = "https://live20.nowgoal25.com/"
@@ -60,6 +62,15 @@ def _get_shared_requests_session():
             session.mount("https://", adapter)
             session.mount("http://", adapter)
             session.headers.update(_REQUEST_HEADERS)
+            
+            # --- INTEGRACIÓN DE PROXY ---
+            proxy_url = os.environ.get('PROXY_URL')
+            if proxy_url:
+                proxies = {"http": proxy_url, "https": proxy_url}
+                session.proxies.update(proxies)
+                print("[INFO] Sesión de Requests configurada para usar proxy.")
+            # --------------------------
+
             _requests_session = session
         return _requests_session
 
@@ -91,8 +102,25 @@ async def _fetch_nowgoal_html(path: str | None = None, filter_state: int | None 
         return html_content
 
     try:
+        proxy_config = None
+        proxy_url = os.environ.get('PROXY_URL')
+        if proxy_url:
+            # Playwright necesita separar usuario, contraseña, servidor y puerto
+            # Asumimos un formato: http://user:pass@host:port
+            try:
+                from urllib.parse import urlparse
+                parsed_url = urlparse(proxy_url)
+                proxy_config = {
+                    'server': f"{parsed_url.hostname}:{parsed_url.port}",
+                    'username': parsed_url.username,
+                    'password': parsed_url.password
+                }
+                print("[INFO] Playwright configurado para usar proxy.")
+            except Exception as e:
+                print(f"[ERROR] No se pudo parsear la URL del proxy para Playwright: {e}")
+
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(headless=True, proxy=proxy_config)
             page = await browser.new_page()
             try:
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
@@ -439,18 +467,27 @@ def proximos():
 def mostrar_estudio(match_id):
     """
     Esta ruta se activa cuando un usuario visita /estudio/ID_DEL_PARTIDO.
+    Implementa la lógica de caché.
     """
     print(f"Recibida petición para el estudio del partido ID: {match_id}")
     
-    # Llama a la función principal de tu módulo de scraping
+    # 1. Buscar en caché primero
+    cached_data = cache_manager.get_from_cache(match_id)
+    if cached_data:
+        return render_template('estudio.html', data=cached_data, format_ah=format_ah_as_decimal_string_of)
+
+    # 2. Si no está en caché, hacer scraping
+    print(f"[SCRAPING] Iniciando análisis completo para el partido ID: {match_id}")
     datos_partido = obtener_datos_completos_partido(match_id)
     
     if not datos_partido or "error" in datos_partido:
-        # Si hay un error, puedes mostrar una página de error
         print(f"Error al obtener datos para {match_id}: {datos_partido.get('error')}")
         abort(500, description=datos_partido.get('error', 'Error desconocido'))
 
-    # Si todo va bien, renderiza la plantilla HTML pasándole los datos
+    # 3. Guardar en caché si el scraping fue exitoso
+    cache_manager.set_to_cache(match_id, datos_partido)
+
+    # 4. Renderizar la plantilla con los datos nuevos
     print(f"Datos obtenidos para {datos_partido['home_name']} vs {datos_partido['away_name']}. Renderizando plantilla...")
     return render_template('estudio.html', data=datos_partido, format_ah=format_ah_as_decimal_string_of)
 
@@ -521,22 +558,31 @@ def api_preview(match_id):
 @app.route('/api/analisis/<string:match_id>')
 def api_analisis(match_id):
     """
-    Servicio de analisis profundo bajo demanda.
+    Servicio de analisis profundo bajo demanda con CACHÉ.
     Devuelve tanto el payload complejo como el HTML simplificado.
     """
     try:
-        datos = obtener_datos_completos_partido(match_id)
-        if not datos or (isinstance(datos, dict) and datos.get('error')):
-            return jsonify({'error': (datos or {}).get('error', 'No se pudieron obtener datos.')}), 500
+        # 1. Buscar en caché primero
+        cached_data = cache_manager.get_from_cache(match_id)
+        if cached_data:
+            datos = cached_data
+        else:
+            # 2. Si no está en caché, hacer scraping
+            print(f"[SCRAPING] Iniciando análisis completo para API del partido ID: {match_id}")
+            datos = obtener_datos_completos_partido(match_id)
+            if not datos or (isinstance(datos, dict) and datos.get('error')):
+                return jsonify({'error': (datos or {}).get('error', 'No se pudieron obtener datos.')}), 500
+            # 3. Guardar en caché
+            cache_manager.set_to_cache(match_id, datos)
 
-        # --- Lógica para el payload complejo (la original) ---
+        # --- Lógica de procesamiento (idéntica a la anterior) ---
         def df_to_rows(df):
             rows = []
             try:
                 if df is not None and hasattr(df, 'iterrows'):
                     for idx, row in df.iterrows():
                         label = str(idx)
-                        label = label.replace('Shots on Goal', 'Tiros a Puerta')                                     .replace('Shots', 'Tiros')                                     .replace('Dangerous Attacks', 'Ataques Peligrosos')                                     .replace('Attacks', 'Ataques')
+                        label = label.replace('Shots on Goal', 'Tiros a Puerta').replace('Shots', 'Tiros').replace('Dangerous Attacks', 'Ataques Peligrosos').replace('Attacks', 'Ataques')
                         try:
                             home_val = row['Casa']
                         except Exception:
@@ -568,7 +614,6 @@ def api_analisis(match_id):
             }
         }
         
-        # --- START COVERAGE CALCULATION ---
         main_odds = datos.get("main_match_odds_data")
         home_name = datos.get("home_name")
         away_name = datos.get("away_name")
@@ -586,30 +631,21 @@ def api_analisis(match_id):
                 score_str = details.get('score', '').replace(' ', '').replace(':', '-')
                 if not score_str or '?' in score_str:
                     return 'NEUTRO'
-
                 h_home = details.get('home_team')
                 h_away = details.get('away_team')
-                
                 status, _ = check_handicap_cover(score_str, ah_actual_num, favorito_actual_name, h_home, h_away, home_name)
                 return status
             except Exception:
                 return 'NEUTRO'
                 
-        # --- Análisis mejorado de H2H Rivales ---
         def analyze_h2h_rivals(home_result, away_result):
             if not home_result or not away_result:
                 return None
-                
             try:
-                # Obtener resultados de los partidos
                 home_goals = list(map(int, home_result.get('score', '0-0').split('-')))
                 away_goals = list(map(int, away_result.get('score', '0-0').split('-')))
-                
-                # Calcular diferencia de goles
                 home_goal_diff = home_goals[0] - home_goals[1]
                 away_goal_diff = away_goals[0] - away_goals[1]
-                
-                # Comparar resultados
                 if home_goal_diff > away_goal_diff:
                     return "Contra rivales comunes, el Equipo Local ha obtenido mejores resultados"
                 elif away_goal_diff > home_goal_diff:
@@ -619,15 +655,11 @@ def api_analisis(match_id):
             except Exception:
                 return None
                 
-        # --- Análisis de Comparativas Indirectas ---
         def analyze_indirect_comparison(result, team_name):
             if not result:
                 return None
-                
             try:
-                # Determinar si el equipo cubrió el handicap
                 status = get_cover_status_vs_current(result)
-                
                 if status == 'CUBIERTO':
                     return f"Contra este rival, {team_name} habría cubierto el handicap"
                 elif status == 'NO CUBIERTO':
@@ -636,7 +668,6 @@ def api_analisis(match_id):
                     return f"Contra este rival, el resultado para {team_name} sería indeterminado"
             except Exception:
                 return None
-        # --- END COVERAGE CALCULATION ---
 
         last_home = (datos.get('last_home_match') or {})
         last_home_details = last_home.get('details') or {}
@@ -740,7 +771,6 @@ def api_analisis(match_id):
                 'analysis': analyze_indirect_comparison(comp_right_details, datos.get('away_name'))
             }
 
-        # --- Lógica para el HTML simplificado ---
         h2h_data = datos.get("h2h_data")
         simplified_html = ""
         if all([main_odds, h2h_data, home_name, away_name]):
@@ -775,4 +805,4 @@ def start_analysis_background():
     return jsonify({'status': 'success', 'message': f'Análisis iniciado para el partido {match_id}'})
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True) # debug=True es útil para desarrollar
+    app.run(host='0.0.0.0', port=5000, debug=False)

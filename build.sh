@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# exit on error
+# Salir inmediatamente si un comando falla
 set -o errexit
 
+# 1. Instalar las dependencias de Python
 pip install -r requirements.txt
 
-py -m playwright install --with-deps
+# 2. Instalar los navegadores y sus dependencias de sistema operativo
+# El flag --with-deps es CRÍTICO para que funcione en el entorno Linux de Render
+python -m playwright install --with-deps
