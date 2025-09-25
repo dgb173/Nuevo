@@ -943,61 +943,110 @@ def display_other_feature_ui2():
 
 def extract_indirect_comparison_data(soup):
     """
-    Extrae los datos de los dos paneles de Comparativas Indirectas.
+    Extrae y normaliza la información necesaria para las comparativas indirectas.
+    Utiliza los datos disponibles en las tablas históricas para reconstruir ambos paneles.
     """
     data = {"comp1": None, "comp2": None}
-    comparativas_divs = soup.select("div.football-history-list > div.content") # Asumiendo una estructura de selectores; ajustar si es necesario.
-
-    if len(comparativas_divs) < 2:
+    if not soup:
         return data
 
-    def parse_comparison_box(box_soup):
-        try:
-            # Título: "Yangon United FC U21 vs. Últ. Rival de Dagon FC U21"
-            title = box_soup.find("div", class_="title").get_text(strip=True)
-            main_team_name = title.split(' vs. ')[0]
+    _, _, league_id, home_name, away_name, _ = get_team_league_info_from_script_of(soup)
+    if not home_name or not away_name:
+        return data
 
-            # Resultado: "0 : 1"
-            res_text = box_soup.find(string=re.compile(r"Res\s*:")).find_next("span").get_text(strip=True)
-            res_raw = res_text.replace(' ', '').replace(':', '-')
+    def _clean_numeric(value: str) -> str:
+        if value is None:
+            return "0"
+        text = re.sub(r"<[^>]+>", "", str(value)).strip()
+        return text if text and text not in {"-", "?"} else "0"
 
-            # Hándicap Asiático: "AH: 4"
-            ah_text = box_soup.find(string=re.compile(r"AH\s*:")).find_next("span").get_text(strip=True)
-            ah_num = parse_ah_to_number_of(ah_text)
+    def _build_stats(match_id):
+        base_stats = {
+            "tiros_casa": "0", "tiros_fuera": "0",
+            "tiros_puerta_casa": "0", "tiros_puerta_fuera": "0",
+            "ataques_casa": "0", "ataques_fuera": "0",
+            "ataques_peligrosos_casa": "0", "ataques_peligrosos_fuera": "0",
+        }
+        if not match_id:
+            return base_stats
+        stats_df = get_match_progression_stats_data(str(match_id))
+        if stats_df is None or getattr(stats_df, "empty", True):
+            return base_stats
 
-            # Localía: "H" o "A"
-            localia_text = box_soup.find(string=re.compile(r"Localía de")).find_next("span").get_text(strip=True)
+        def _from_df(row_name: str, column: str) -> str:
+            try:
+                value = stats_df.loc[row_name, column]
+                if isinstance(value, pd.Series):
+                    value = value.iloc[0]
+                return _clean_numeric(value)
+            except Exception:
+                return "0"
 
-            # Estadísticas
-            stats = {}
-            stats_table = box_soup.find("table") # Asumiendo que las stats están en una tabla
-            rows = stats_table.find_all("tr")
-            
-            # Ejemplo de extracción de estadísticas (ajustar a la estructura real del HTML)
-            # Esto es un placeholder, el código real podría necesitar ser más robusto
-            stats['tiros_casa'] = rows[0].find_all('td')[0].text.strip()
-            stats['tiros_fuera'] = rows[0].find_all('td')[2].text.strip()
-            stats['tiros_puerta_casa'] = rows[1].find_all('td')[0].text.strip()
-            stats['tiros_puerta_fuera'] = rows[1].find_all('td')[2].text.strip()
-            stats['ataques_casa'] = rows[2].find_all('td')[0].text.strip()
-            stats['ataques_fuera'] = rows[2].find_all('td')[2].text.strip()
-            stats['ataques_peligrosos_casa'] = rows[3].find_all('td')[0].text.strip()
-            stats['ataques_peligrosos_fuera'] = rows[3].find_all('td')[2].text.strip()
+        base_stats.update({
+            "tiros_casa": _from_df("Shots", "Casa"),
+            "tiros_fuera": _from_df("Shots", "Fuera"),
+            "tiros_puerta_casa": _from_df("Shots on Goal", "Casa"),
+            "tiros_puerta_fuera": _from_df("Shots on Goal", "Fuera"),
+            "ataques_casa": _from_df("Attacks", "Casa"),
+            "ataques_fuera": _from_df("Attacks", "Fuera"),
+            "ataques_peligrosos_casa": _from_df("Dangerous Attacks", "Casa"),
+            "ataques_peligrosos_fuera": _from_df("Dangerous Attacks", "Fuera"),
+        })
+        return base_stats
 
-            return {
-                "main_team": main_team_name,
-                "resultado": res_text,
-                "resultado_raw": res_raw,
-                "ah_raw": ah_text,
-                "ah_num": ah_num,
-                "localia": localia_text,
-                "stats": stats
-            }
-        except Exception:
+    def _extract_last_match(table_id, team_name, league_filter, is_home):
+        match = extract_last_match_in_league_of(soup, table_id, team_name, league_filter, is_home)
+        if match or not league_filter:
+            return match
+        return extract_last_match_in_league_of(soup, table_id, team_name, None, is_home)
+
+    league_filter = league_id if league_id else None
+    last_home = _extract_last_match("table_v1", home_name, league_filter, True)
+    last_away = _extract_last_match("table_v2", away_name, league_filter, False)
+
+    def _find_comparative(table_id, main_team, opponent, is_home_table):
+        if not opponent:
             return None
+        comp = extract_comparative_match_of(soup, table_id, main_team, opponent, league_filter, is_home_table)
+        if comp or not league_filter:
+            return comp
+        return extract_comparative_match_of(soup, table_id, main_team, opponent, None, is_home_table)
 
-    data["comp1"] = parse_comparison_box(comparativas_divs[0])
-    data["comp2"] = parse_comparison_box(comparativas_divs[1])
+    if last_away:
+        opponent_from_away = last_away.get("home_team")
+        comp1_raw = _find_comparative("table_v1", home_name, opponent_from_away, True)
+        if comp1_raw:
+            score = comp1_raw.get("score", "?:?")
+            resultado = score.replace(":", " : ") if ":" in score else score
+            resultado_raw = score.replace(":", "-") if ":" in score else score
+            ah_raw = comp1_raw.get("ah_line", "-") or "-"
+            data["comp1"] = {
+                "main_team": home_name,
+                "resultado": resultado,
+                "resultado_raw": resultado_raw,
+                "ah_raw": ah_raw,
+                "ah_num": parse_ah_to_number_of(str(ah_raw)),
+                "localia": comp1_raw.get("localia", "H"),
+                "stats": _build_stats(comp1_raw.get("match_id"))
+            }
+
+    if last_home:
+        opponent_from_home = last_home.get("away_team")
+        comp2_raw = _find_comparative("table_v2", away_name, opponent_from_home, False)
+        if comp2_raw:
+            score = comp2_raw.get("score", "?:?")
+            resultado = score.replace(":", " : ") if ":" in score else score
+            resultado_raw = score.replace(":", "-") if ":" in score else score
+            ah_raw = comp2_raw.get("ah_line", "-") or "-"
+            data["comp2"] = {
+                "main_team": away_name,
+                "resultado": resultado,
+                "resultado_raw": resultado_raw,
+                "ah_raw": ah_raw,
+                "ah_num": parse_ah_to_number_of(str(ah_raw)),
+                "localia": comp2_raw.get("localia", "H"),
+                "stats": _build_stats(comp2_raw.get("match_id"))
+            }
 
     return data
 
