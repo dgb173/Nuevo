@@ -189,6 +189,37 @@ def _parse_handicap_to_float(text: str):
     # Si viene como cadena normal (ej. "+0.25" o "-0,75")
     return _parse_number_clean(t.replace('+', ''))
 
+
+def _parse_match_datetime(raw_value: str) -> datetime.datetime | None:
+    """Parsea múltiples formatos de fecha/hora utilizados por NowGoal."""
+    if not raw_value:
+        return None
+
+    text = str(raw_value).strip()
+    if not text:
+        return None
+
+    candidate_formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %I:%M:%S %p",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %I:%M:%S %p",
+    ]
+
+    for fmt in candidate_formats:
+        try:
+            return datetime.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+
+    try:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _bucket_to_half(value: float) -> float:
     if value is None:
         return None
@@ -237,9 +268,8 @@ def parse_main_page_matches(html_content, limit=20, offset=0, handicap_filter=No
         time_cell = row.find('td', {'name': 'timeData'})
         if not time_cell or not time_cell.has_attr('data-t'): continue
         
-        try:
-            match_time = datetime.datetime.strptime(time_cell['data-t'], '%Y-%m-%d %H:%M:%S')
-        except (ValueError, IndexError):
+        match_time = _parse_match_datetime(time_cell.get('data-t'))
+        if not match_time:
             continue
 
         if match_time < now_utc: continue
@@ -326,10 +356,10 @@ def parse_main_page_finished_matches(html_content, limit=20, offset=0, handicap_
         time_cell = row.find('td', {'name': 'timeData'})
         match_time = datetime.datetime.now()
         if time_cell and time_cell.has_attr('data-t'):
-            try:
-                match_time = datetime.datetime.strptime(time_cell['data-t'], '%Y-%m-%d %H:%M:%S')
-            except (ValueError, IndexError):
+            parsed_time = _parse_match_datetime(time_cell['data-t'])
+            if not parsed_time:
                 continue
+            match_time = parsed_time
         
         finished_matches.append({
             "id": match_id,
