@@ -28,7 +28,7 @@ app = Flask(__name__)
 import os
 
 # --- Mantén tu lógica para la página principal ---
-URL_NOWGOAL = "https://live20.nowgoal25.com/"
+URL_NOWGOAL = "https://www.nowgoal.com/"
 
 REQUEST_TIMEOUT_SECONDS = 12
 _REQUEST_HEADERS = {
