@@ -4,6 +4,7 @@ import asyncio
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 import datetime
+from email.utils import parsedate_to_datetime
 import re
 import math
 import threading
@@ -189,6 +190,128 @@ def _parse_handicap_to_float(text: str):
     # Si viene como cadena normal (ej. "+0.25" o "-0,75")
     return _parse_number_clean(t.replace('+', ''))
 
+
+def _parse_match_datetime(raw_value: str) -> datetime.datetime | None:
+    """Parsea múltiples formatos de fecha/hora utilizados por NowGoal."""
+    if not raw_value:
+        return None
+
+    original_text = str(raw_value).strip()
+    if not original_text:
+        return None
+
+    text = original_text.replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text)
+
+    # Quita sufijos conocidos como "GMT", "UTC" o textos entre paréntesis.
+    text = re.sub(r"\s*\((?:UTC|GMT)[^)]*\)$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+(?:UTC|GMT)\b", "", text, flags=re.IGNORECASE).strip()
+    # Algunas cadenas incluyen paréntesis con nombres de zonas horarias al final.
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", text)
+
+    # Timestamps en segundos o milisegundos.
+    if re.fullmatch(r"[+-]?\d{10,16}", text):
+        try:
+            value = int(text)
+            if len(text) > 10:
+                value /= 1000.0
+            return datetime.datetime.utcfromtimestamp(value)
+        except (OverflowError, ValueError):
+            pass
+
+    # Normaliza offsets como +0800 -> +08:00 y elimina espacios previos.
+    def _normalize_offset(s: str) -> str:
+        s = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", s)
+        return re.sub(r"\s*([+-]\d{2}:\d{2})$", r"\1", s)
+
+    iso_candidate = text.replace("T", " ").replace("Z", "+00:00")
+    iso_candidate = _normalize_offset(iso_candidate)
+
+    # Maneja fracciones de segundo como ".000" manteniendo el resto de la cadena.
+    if "." in iso_candidate:
+        main, frac = iso_candidate.split(".", 1)
+        frac_digits = re.match(r"(\d+)", frac)
+        if frac_digits:
+            iso_candidate = f"{main}.{frac_digits.group(1)}"
+        else:
+            iso_candidate = main
+
+    try:
+        dt = datetime.datetime.fromisoformat(iso_candidate)
+        if dt.tzinfo:
+            return dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return dt
+    except ValueError:
+        pass
+
+    candidate_formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y %I:%M:%S %p",
+        "%m/%d/%Y %I:%M %p",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y %I:%M:%S %p",
+        "%d/%m/%Y %I:%M %p",
+        "%Y-%m-%d %I:%M:%S %p",
+        "%Y-%m-%d %I:%M %p",
+        "%a %b %d %Y %H:%M:%S",
+        "%a %b %d %H:%M:%S %Y",
+        "%a %b %d %Y %H:%M",
+        "%a %b %d %H:%M %Y",
+    ]
+
+    for fmt in candidate_formats:
+        try:
+            return datetime.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+
+    candidate_formats_tz = [
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M%z",
+        "%Y/%m/%d %H:%M:%S%z",
+        "%Y/%m/%d %H:%M%z",
+        "%m/%d/%Y %H:%M:%S%z",
+        "%m/%d/%Y %H:%M%z",
+        "%m/%d/%Y %I:%M:%S %p%z",
+        "%m/%d/%Y %I:%M %p%z",
+        "%d/%m/%Y %H:%M:%S%z",
+        "%d/%m/%Y %H:%M%z",
+        "%d/%m/%Y %I:%M:%S %p%z",
+        "%d/%m/%Y %I:%M %p%z",
+        "%Y-%m-%d %I:%M:%S %p%z",
+        "%Y-%m-%d %I:%M %p%z",
+        "%a %b %d %Y %H:%M:%S%z",
+        "%a %b %d %H:%M:%S %Y%z",
+        "%a %b %d %Y %H:%M%z",
+        "%a %b %d %H:%M %Y%z",
+    ]
+
+    for fmt in candidate_formats_tz:
+        try:
+            dt = datetime.datetime.strptime(text, fmt)
+            if dt.tzinfo:
+                return dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            return dt
+        except ValueError:
+            continue
+
+    for candidate in (text, original_text):
+        try:
+            dt = parsedate_to_datetime(candidate)
+            if dt.tzinfo:
+                return dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            return dt
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _bucket_to_half(value: float) -> float:
     if value is None:
         return None
@@ -237,9 +360,8 @@ def parse_main_page_matches(html_content, limit=20, offset=0, handicap_filter=No
         time_cell = row.find('td', {'name': 'timeData'})
         if not time_cell or not time_cell.has_attr('data-t'): continue
         
-        try:
-            match_time = datetime.datetime.strptime(time_cell['data-t'], '%Y-%m-%d %H:%M:%S')
-        except (ValueError, IndexError):
+        match_time = _parse_match_datetime(time_cell.get('data-t'))
+        if not match_time:
             continue
 
         if match_time < now_utc: continue
@@ -326,10 +448,10 @@ def parse_main_page_finished_matches(html_content, limit=20, offset=0, handicap_
         time_cell = row.find('td', {'name': 'timeData'})
         match_time = datetime.datetime.now()
         if time_cell and time_cell.has_attr('data-t'):
-            try:
-                match_time = datetime.datetime.strptime(time_cell['data-t'], '%Y-%m-%d %H:%M:%S')
-            except (ValueError, IndexError):
+            parsed_time = _parse_match_datetime(time_cell['data-t'])
+            if not parsed_time:
                 continue
+            match_time = parsed_time
         
         finished_matches.append({
             "id": match_id,
