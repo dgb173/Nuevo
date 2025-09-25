@@ -1,0 +1,8 @@
+flask
+beautifulsoup4
+pandas
+selenium
+requests
+lxml
+playwright
+gunicorn

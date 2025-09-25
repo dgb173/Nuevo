@@ -1,0 +1,154 @@
+
+INFORME TÉCNICO DETALLADO v2 - PROYECTO DE SCRAPING Y ANÁLISIS
+======================================================================
+
+**Fecha de Generación:** 25 de septiembre de 2025
+**Autor:** Gemini
+
+### 1. RESUMEN EJECUTIVO Y METODOLOGÍA
+
+Este documento ofrece un análisis exhaustivo a nivel de código del proyecto de scraping. La aplicación está construida en Python y su propósito es extraer, analizar y presentar datos de partidos de fútbol del sitio `nowgoal25.com`.
+
+#### 1.1. Metodología General
+
+El proyecto emplea un conjunto de metodologías robustas y eficientes:
+
+- **Arquitectura de Servidor Web con Flask:** Se utiliza un servidor Flask (`app.py`) como orquestador central que gestiona las peticiones de los usuarios, sirve páginas web y expone una API RESTful para interacciones dinámicas.
+
+- **Scraping Híbrido (Velocidad y Robustez):**
+    1.  **Intento Rápido con `Requests`:** Para la carga inicial de datos (listas de partidos, vistas previas), la aplicación primero intenta una petición HTTP directa con la librería `requests`. Este método es extremadamente rápido y consume pocos recursos, ya que solo descarga el HTML.
+    2.  **Fallback con `Playwright`/`Selenium`:** Si el método rápido falla o no es suficiente, la aplicación recurre a la automatización de un navegador completo (`headless browser`) usando `Playwright` o `Selenium`. Este método, aunque más lento, es capaz de renderizar JavaScript y manejar contenido dinámico complejo, garantizando la obtención de los datos en casi cualquier escenario.
+
+- **Parsing de HTML con `BeautifulSoup`:** Una vez obtenido el contenido HTML (por cualquiera de los dos métodos), se utiliza la librería `BeautifulSoup` para parsearlo. Esta herramienta permite navegar por el árbol de etiquetas HTML y extraer datos de forma precisa mediante la búsqueda de etiquetas, clases, IDs y otros atributos.
+
+- **Análisis de Datos con `Pandas`:** Para las estadísticas complejas (clasificaciones, historial de partidos), los datos extraídos se cargan en DataFrames de `Pandas`. Esto permite una manipulación, limpieza y análisis de datos muy potente y eficiente.
+
+- **API RESTful para Desacoplamiento Frontend-Backend:** La aplicación expone rutas de API (ej. `/api/preview/...`) que devuelven datos en formato JSON. Esto permite que el frontend (JavaScript en el navegador) solicite y muestre información de forma dinámica sin necesidad de recargar la página entera, mejorando la experiencia de usuario.
+
+- **Ejecución Concurrente:** Para optimizar los tiempos de espera en el scraping profundo, se utiliza `ThreadPoolExecutor`, que permite lanzar múltiples tareas de extracción de datos (ej. obtener estadísticas de varios partidos históricos) en paralelo.
+
+--- 
+
+### 2. ANÁLISIS DE CÓDIGO FUENTE - FUNCIÓN POR FUNCIÓN
+
+#### 2.1. Archivo: `app.py` (El Orquestador)
+
+Este archivo es el punto de entrada y el controlador principal de la aplicación web.
+
+**Funciones de Configuración y Auxiliares:**
+
+- `_build_nowgoal_url(path)`: Construye una URL completa para el sitio Nowgoal a partir de una ruta relativa.
+- `_get_shared_requests_session()`: Crea y mantiene una única sesión de `requests` para reutilizar conexiones y configuraciones (reintentos, cabeceras), mejorando la eficiencia.
+- `_fetch_nowgoal_html_sync(url)`: Realiza la petición HTTP síncrona usando la sesión compartida. Es el núcleo del método de scraping rápido.
+- `_fetch_nowgoal_html(...)`: Implementa la lógica de scraping híbrido. Llama a `_fetch_nowgoal_html_sync` y, si falla, lanza un navegador `Playwright` para obtener el HTML.
+- `_parse_number_clean(s)`, `_parse_handicap_to_float(text)`, `_bucket_to_half(value)`, `normalize_handicap_to_half_bucket_str(text)`: Conjunto de funciones de utilidad para limpiar y normalizar datos numéricos y de hándicap asiático, convirtiendo texto como "-0.5/1" en valores flotantes estandarizados como `-0.75` y luego agrupándolos (ej. a `-0.5`).
+
+**Funciones de Scraping y Parsing (Página Principal):**
+
+- `parse_main_page_matches(html_content, ...)`: 
+    - **Propósito:** Extraer la lista de partidos *futuros* del HTML de la página principal.
+    - **Extracción HTML:**
+        - Busca todas las etiquetas `<tr>` cuyo `id` comienza con `"tr1_"`. Cada una de estas filas representa un partido.
+        - De cada fila, extrae:
+            - **ID del partido:** Del atributo `id` de la fila.
+            - **Hora:** De la etiqueta `<td>` con `name="timeData"`, leyendo el atributo `data-t`.
+            - **Equipos:** De las etiquetas `<a>` con `id` como `"team1_{match_id}"` y `"team2_{match_id}"`.
+            - **Cuotas:** Del atributo `odds` de la etiqueta `<tr>`, que es una cadena de texto separada por comas. El hándicap es el 3er valor y la línea de gol el 11º.
+    - **Lógica:** Filtra los partidos que ya han comenzado, ordena los restantes por hora y devuelve una lista de diccionarios.
+
+- `parse_main_page_finished_matches(html_content, ...)`:
+    - **Propósito:** Similar a la anterior, pero para extraer partidos *finalizados* de la página de resultados.
+    - **Extracción HTML:**
+        - Misma lógica de búsqueda de filas `<tr>` con `id` `"tr1_..."`.
+        - **Filtro de Estado:** Solo procesa filas con `state="-1"`, que indica partido finalizado.
+        - **Resultado:** Busca en la 7ª celda (`<td>`) una etiqueta `<b>` que contiene el marcador final (ej. "2-1").
+        - El resto de datos (equipos, cuotas) se extraen de forma idéntica a la función de partidos futuros.
+
+- `get_main_page_matches_async(...)` y `get_main_page_finished_matches_async(...)`:
+    - **Propósito:** Funciones asíncronas que orquestan el proceso de obtener la lista de partidos. Llaman a `_fetch_nowgoal_html` para obtener el código y luego a la función de `parse` correspondiente.
+
+**Rutas de la Aplicación (`@app.route`)**
+
+- `index()` -> Ruta `/`:
+    - **Función:** Página de inicio, muestra los próximos partidos.
+    - **Lógica:** Llama a `get_main_page_matches_async`, obtiene la lista de partidos y la pasa a la plantilla `index.html` para ser renderizada.
+
+- `resultados()` -> Ruta `/resultados`:
+    - **Función:** Muestra la lista de partidos ya finalizados.
+    - **Lógica:** Llama a `get_main_page_finished_matches_async` y renderiza la misma plantilla `index.html` pero con los datos de los partidos terminados.
+
+- `api_matches()` y `api_finished_matches()` -> Rutas `/api/matches` y `/api/finished_matches`:
+    - **Función:** Endpoints de API para paginación (carga infinita en el frontend). Devuelven los datos de los partidos en formato JSON.
+
+- `mostrar_estudio(match_id)` -> Ruta `/estudio/<match_id>`:
+    - **Función:** Muestra la página de análisis detallado para un solo partido.
+    - **Lógica:** Recibe un `match_id`, llama a la función `obtener_datos_completos_partido(match_id)` del módulo `estudio_scraper` y, si tiene éxito, pasa el enorme diccionario de datos resultante a la plantilla `estudio.html`.
+
+- `analizar_partido()` -> Ruta `/analizar_partido`:
+    - **Función:** Presenta un formulario para introducir un ID de partido y ver su análisis.
+    - **Lógica:** Similar a `mostrar_estudio`, pero se activa mediante un formulario POST.
+
+- `api_preview(match_id)` -> Ruta `/api/preview/<match_id>`:
+    - **Función:** API para la vista previa rápida que se muestra al hacer clic en el icono del "ojo".
+    - **Lógica:** Llama a `obtener_datos_preview_ligero(match_id)` o `obtener_datos_preview_rapido(match_id)` del scraper, que son versiones optimizadas y rápidas, y devuelve los datos en JSON.
+
+- `api_analisis(match_id)` -> Ruta `/api/analisis/<match_id>`:
+    - **Función:** El endpoint de API más complejo. Devuelve un JSON muy detallado con el análisis completo de un partido.
+    - **Lógica:** Llama a `obtener_datos_completos_partido` y luego procesa los datos devueltos para construir una estructura JSON específica. Aquí se realizan cálculos como `check_handicap_cover` para determinar si en partidos históricos se habría cubierto la línea de hándicap actual.
+
+#### 2.2. Archivo: `modules/estudio_scraper.py` (El Cerebro)
+
+Este módulo contiene la lógica más compleja y detallada para scrapear una única página de partido.
+
+**Funciones Principales de Orquestación:**
+
+- `obtener_datos_completos_partido(match_id)`:
+    - **Propósito:** Es la función maestra. Orquesta todo el proceso de scraping profundo.
+    - **Lógica y Metodología:**
+        1.  Inicia un navegador `Selenium` en modo `headless`.
+        2.  Navega a la URL de H2H del partido (ej. `/match/h2h-{match_id}`).
+        3.  Espera a que elementos clave de la página (`table_v1`) estén presentes.
+        4.  Simula la interacción del usuario: cambia los `select` de las tablas de historial a "8" partidos para cargar más datos.
+        5.  Una vez la página está en el estado deseado, extrae todo el HTML con `driver.page_source` y lo pasa a `BeautifulSoup`.
+        6.  Lanza múltiples tareas en paralelo (`ThreadPoolExecutor`) para llamar a las diversas funciones de extracción (`extract_...`) y parseo, optimizando el tiempo.
+        7.  Recopila los resultados de todas las tareas y los estructura en un único y gran diccionario que se devuelve a `app.py`.
+
+- `obtener_datos_preview_rapido(match_id)` y `obtener_datos_preview_ligero(match_id)`:
+    - **Propósito:** Versiones optimizadas para la vista previa.
+    - **Metodología:** `ligero` usa `requests` para máxima velocidad, mientras que `rapido` usa `Selenium` pero solo extrae un subconjunto de datos. Ambas están diseñadas para dar una respuesta rápida a la API de vista previa.
+
+**Funciones de Extracción de Datos (HTML):**
+
+Estas funciones son llamadas por `obtener_datos_completos_partido` y cada una se especializa en una sección de la página.
+
+- `get_team_league_info_from_script_of(soup)`:
+    - **Extracción:** No parsea HTML, sino que busca una etiqueta `<script>` en la página que contiene una variable JavaScript `_matchInfo`. Usa expresiones regulares para extraer de esta cadena de texto los IDs y nombres de los equipos y la liga.
+
+- `extract_bet365_initial_odds_of(soup)`:
+    - **Extracción:** Busca una fila `<tr>` con `id="tr_o_1_8"` o `"tr_o_1_31"` (que corresponden a Bet365). De las celdas `<td>` de esa fila, extrae las cuotas iniciales de Hándicap Asiático y Goles.
+
+- `extract_standings_data_from_h2h_page_of(soup, team_name)`:
+    - **Extracción:** Busca el `div` con `id="porletP4"` (sección de clasificación). Dentro, localiza la tabla de clasificación (`team-table-home` o `team-table-guest`) y extrae los datos de Partidos Jugados, Victorias, Empates, Derrotas, etc., tanto totales como específicos de local/visitante.
+
+- `extract_h2h_data_of(soup, ...)`:
+    - **Extracción:** Se enfoca en la tabla de enfrentamientos directos (`<table id="table_v3">`). Itera sobre sus filas (`<tr id="tr3_..."`) y extrae el resultado y hándicap de cada enfrentamiento pasado entre los dos equipos.
+
+- `extract_last_match_in_league_of(soup, ...)`:
+    - **Extracción:** Busca en las tablas de historial (`table_v1` o `table_v2`) el último partido jugado por un equipo en la misma liga.
+
+- `get_match_progression_stats_data(match_id)`:
+    - **Extracción:** Esta función hace una nueva petición `requests` a una URL de "live" del partido (`/match/live-{match_id}`). De ahí, busca el `div` con `id="teamTechDiv_detail"` y extrae las estadísticas finales del partido (Córners, Tiros, Tarjetas, etc.).
+
+**Funciones de Lógica y Análisis:**
+
+- `check_handicap_cover(...)`, `check_goal_line_cover(...)`:
+    - **Propósito:** Implementan la lógica de apuestas. Reciben un resultado (ej. "2-1"), una línea de hándicap (ej. -0.75) o de goles (ej. 2.5) y determinan si la apuesta habría sido ganada ("CUBIERTO"), perdida ("NO CUBIERTO") o devuelta ("PUSH").
+
+- `generar_analisis_mercado_simplificado(...)` y `generar_analisis_completo_mercado(...)`:
+    - **Propósito:** Toman los datos ya extraídos y procesados para generar un bloque de HTML con un resumen y análisis. Comparan la línea de hándicap actual con la de partidos históricos y señalan si el mercado considera a un equipo "más favorito" o "menos favorito" que antes. El resultado es un texto explicativo que se inyecta directamente en la página web.
+
+--- 
+
+### 3. CONCLUSIÓN
+
+Este análisis detallado demuestra que el proyecto está bien estructurado y utiliza técnicas avanzadas y eficientes para cumplir su objetivo. La combinación de diferentes metodologías de scraping, el uso de análisis de datos con Pandas y la exposición de una API para el frontend conforman una base sólida y profesional. Las áreas de mejora identificadas en el informe anterior (creación de `requirements.txt`, refactorización y caching con base de datos) siguen siendo recomendaciones válidas para evolucionar el proyecto.
