@@ -3,7 +3,10 @@ from flask import Flask, render_template, abort, request
 import asyncio
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
+from pathlib import Path
 import datetime
+import os
+import shutil
 import re
 import math
 import threading
@@ -50,6 +53,49 @@ def _build_nowgoal_url(path: str | None = None) -> str:
     return f"{base}/{suffix}"
 
 
+def _resolve_chromium_executable() -> str | None:
+    candidates = [
+        os.environ.get("CHROME_BINARY"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("google-chrome"),
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    def _search_in_base(base: Path) -> str | None:
+        if not base.exists():
+            return None
+        search_targets = ("headless_shell", "chrome", "chromium", "chrome-wrapper")
+        for target in search_targets:
+            for candidate in base.rglob(target):
+                try:
+                    if candidate.is_file() and os.access(candidate, os.X_OK):
+                        return str(candidate)
+                except OSError:
+                    continue
+        return None
+
+    pw_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if pw_path:
+        found = _search_in_base(Path(pw_path))
+        if found:
+            return found
+
+    cache_base = Path.home() / ".cache" / "ms-playwright"
+    found = _search_in_base(cache_base)
+    if found:
+        return found
+
+    return None
+
+
+
+
 def _get_shared_requests_session():
     global _requests_session
     with _requests_session_lock:
@@ -92,7 +138,18 @@ async def _fetch_nowgoal_html(path: str | None = None, filter_state: int | None 
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            launch_kwargs = {
+                "headless": True,
+                "args": [
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            }
+            chromium_executable = _resolve_chromium_executable()
+            if chromium_executable:
+                launch_kwargs["executable_path"] = chromium_executable
+            browser = await p.chromium.launch(**launch_kwargs)
             page = await browser.new_page()
             try:
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
