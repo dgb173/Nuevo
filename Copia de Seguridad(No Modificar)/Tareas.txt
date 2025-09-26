@@ -1,0 +1,80 @@
+Sí. De hecho hay varias formas útiles (y legales) de **combinar IA con tu stack de scraping** para ganar rapidez, resiliencia y menos mantenimiento cuando cambian los layouts.
+
+# 1) Extracción estructurada con LLM (del HTML a JSON “limpio”)
+
+* En lugar de depender solo de selectores frágiles, puedes pasar el **HTML bruto** a un LLM con un **JSON Schema** / Pydantic y pedirle que devuelva campos exactos (equipo\_local, AH, cuota, fecha, etc.). Herramientas/ejemplos: **LLM-Scraper** (genera datos estructurados con JSON Schema) y marcos como **LangExtract** para extracción verificable. ([GitHub][1])
+* Pros: se rompe menos cuando cambian clases/CSS; reduces hotfixes. Contras: coste/latencia de inferencia (se compensa cacheando y llamando solo cuando falla el parser clásico). Resumen y comparativas recientes de “AI scrapers” (Firecrawl, ScrapeGraphAI, etc.) lo confirman. ([Bright Data][2])
+
+# 2) “Agentes” que navegan por la web (Playwright + LLM)
+
+* Para páginas altamente dinámicas (odds en vivo, flujos con clicks, filtros), un **agente LLM** puede planificar pasos y operar **Playwright** (sin UI cuando sea posible), localizar botones/campos por semántica y completar tareas. Papers como **Agent-E** y **Steward** describen navegadores dirigidos por LLM; reseñas 2024-2025 recogen frameworks que integran LLM + Playwright/Selenium. ([arXiv][3])
+* Regla de oro para rendimiento: usa **request context** de Playwright para golpear **XHR/JSON** directamente y deja el “agent” como *fallback* solo cuando haga falta interacción real (así no te penaliza el render). ([Medium][4])
+
+# 3) “Crawlers/ETL” ya IA-nativos como servicio
+
+* **Firecrawl** te entrega contenido “LLM-ready” (Markdown/JSON), con crawling y anti-bot integrados; útil como **pre-proceso** cuando no quieres mantener el crawler bajo fuego. ([Firecrawl - The Web Data API for AI][5])
+* **ScrapeGraphAI** automatiza pipelines de scraping con LLM (menos mantenimiento ante cambios de layout). Comparativas 2025 lo sitúan entre las opciones punteras. ([ScrapeGraphAI][6])
+
+# 4) PDFs/tablas y docs “duros”
+
+* Si en el flujo te aparecen PDFs con cuotas, reglamentos, etc., **LlamaParse** y **Docling** son de lo más preciso/rápido hoy para convertir a tablas/JSON; hay benchmarks 2025 con métricas de exactitud y velocidad. ([LlamaIndex][7])
+
+---
+
+## Cómo lo conectaría con **tus ficheros** (`app.py`, `scraper_partidos*.py`)
+
+### A) Mantén tu transporte “rápido” y añade IA solo como *fallback inteligente*
+
+1. **Primera pasada (rápida):**
+
+   * Sigue con **Playwright request context** o `requests/httpx` para traer HTML/XHR.
+   * Parsea con **BeautifulSoup/selectolax** como ya haces (tu `parse_main_page_matches`/`parse_match_data_from_html`).
+2. **Si falla el selector o el campo viene vacío:**
+
+   * Llamas a un **módulo LLM de extracción** con JSON Schema (p. ej., usando LLM-Scraper o tu propio prompt + validación Pydantic) para **reconstruir los campos** desde el HTML completo. ([GitHub][1])
+3. **Cachea** (por ID de partido + timestamp de la página) para no pagar dos veces la inferencia del mismo contenido.
+4. **Telemetry**: loguea cuándo interviene la IA; si el ratio sube, es señal de que la web cambió.
+
+### B) Auto-healing de selectores
+
+* Cuando el LLM consigue el valor, deja que **propose/valide** un **nuevo selector CSS/XPath** (con ejemplos) y **guárdalo**; la próxima ejecución vuelve al modo rápido sin LLM. (Patrón usado en agentes de navegación y herramientas tipo ScrapeGraphAI). ([ScrapeGraphAI][6])
+
+### C) Para páginas con mucha interacción
+
+* Añade un **modo agente**: si `parse_*` falla dos veces, activa un playbook del **agente LLM + Playwright** (abrir dropdown, aplicar filtro, esperar XHR y capturar el JSON). Limítalo a casos puntuales para no perder throughput. ([arXiv][3])
+
+### D) PDFs en la cadena
+
+* Si en `obtener_datos_completos_partido` aparecen enlaces a PDFs (reglas/estatutos con mercados), manda esos PDFs por **LlamaParse/Docling** → JSON y procesa como si fuera otra fuente. Benchmarks y guías 2025 cubren pros/contras. ([Procycons][8])
+
+---
+
+## ¿Cuándo compensa usar IA en scraping?
+
+* **Estructuras muy cambiantes** o **múltiples dominios** con costes de mantenimiento altos → sí. (Resumen/comparativas 2025). ([Bright Data][2])
+* **Necesitas semántica** (e.g., “quién es favorito real según contexto del texto”) más que solo texto literal → sí.
+* **Bajo coste/alta latencia tolerable** (p. ej., pre-batch nocturno) → sí. En **tiempo real/segundos**, úsala como **fallback**, no como camino principal.
+
+---
+
+## Nota rápida sobre límites éticos/legales
+
+* La IA **no es** para “evadir” barreras tipo CAPTCHA/anti-bot de forma abusiva; manténte en lo permitido por ToS y normativa local. Usa los agentes/servicios con moderación y respeto a *rate limits*. Las reviews de herramientas mencionan “anti-bot handling”, pero eso no sustituye tu cumplimiento. ([Bright Data][2])
+
+---
+
+Si te va bien, en tu repo puedo esbozar:
+
+* Un **módulo `ai_extractor.py`** con JSON Schema para tus campos (equipo\_local, equipo\_visitante, AH, OU, hora, liga, etc.) y **estrategia de fallback**.
+* Un **`agent_mode.py`** que solo se activa si fallan dos pasadas, usando Playwright request-context + plan del LLM para dar con el XHR correcto (sin render completo).
+
+¿Lo monto así con tus rutas (`/api/preview`, `/api/analisis`) y dejo flags `mode=fast|ai|agent`?
+
+[1]: https://github.com/mishushakov/llm-scraper?utm_source=chatgpt.com "mishushakov/llm-scraper: Turn any webpage into ..."
+[2]: https://brightdata.com/blog/ai/best-ai-scraping-tools?utm_source=chatgpt.com "Best AI Web Scraping Tools of 2025: Complete Comparison"
+[3]: https://arxiv.org/html/2407.13032v1?utm_source=chatgpt.com "Agent-E: From Autonomous Web Navigation to ..."
+[4]: https://medium.com/%40learning_37638/state-of-the-art-autonomous-web-agents-2024-2025-3d9d93a5dde2?utm_source=chatgpt.com "State-of-the-Art Autonomous Web Agents (2024–2025)"
+[5]: https://www.firecrawl.dev/?utm_source=chatgpt.com "Firecrawl - The Web Data API for AI"
+[6]: https://scrapegraphai.com/?utm_source=chatgpt.com "ScrapeGraphAI"
+[7]: https://www.llamaindex.ai/blog/pdf-parsing-llamaparse?utm_source=chatgpt.com "Parsing PDFs with LlamaParse: a how-to guide"
+[8]: https://procycons.com/en/blogs/pdf-data-extraction-benchmark/?utm_source=chatgpt.com "PDF Data Extraction Benchmark 2025: Comparing Docling ..."

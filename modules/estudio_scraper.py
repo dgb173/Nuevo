@@ -22,7 +22,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from modules.utils import parse_ah_to_number_of, format_ah_as_decimal_string_of, check_handicap_cover, check_goal_line_cover, get_match_details_from_row_of, extract_final_score_of
 
-BASE_URL_OF = "https://live18.nowgoal25.com"
+BASE_URL_OF = "https://www.nowgoal.com"
 SELENIUM_TIMEOUT_SECONDS_OF = 10
 PLACEHOLDER_NODATA = "*(No disponible)*"
 
