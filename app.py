@@ -6,6 +6,9 @@ from bs4 import BeautifulSoup
 import datetime
 import re
 import math
+import json
+import os
+import html
 import threading
 import requests
 from requests.adapters import HTTPAdapter
@@ -27,14 +30,16 @@ app = Flask(__name__)
 
 # --- Mantén tu lógica para la página principal ---
 URL_NOWGOAL = "https://live20.nowgoal25.com/"
+URL_NOWGOAL_BASE = "https://www.nowgoal.com/"
+DATA_JS_URL = f"{URL_NOWGOAL_BASE}gf/data/bf_en-idn.js"
 
 REQUEST_TIMEOUT_SECONDS = 12
 _REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept": "*/*",
     "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
     "Connection": "keep-alive",
-    "Referer": URL_NOWGOAL,
+    "Referer": URL_NOWGOAL_BASE,
 }
 
 _requests_session = None
@@ -60,6 +65,17 @@ def _get_shared_requests_session():
             session.mount("https://", adapter)
             session.mount("http://", adapter)
             session.headers.update(_REQUEST_HEADERS)
+
+            proxy_url = os.environ.get('PROXY_URL')
+            if proxy_url:
+                proxy_url = proxy_url.strip()
+                if proxy_url and proxy_url.upper() != 'URL_DE_TU_PROXY':
+                    proxies = {"http": proxy_url, "https": proxy_url}
+                    session.proxies.update(proxies)
+                    print('[INFO] Requests session configured to use proxy.')
+                else:
+                    print('[INFO] PROXY_URL set but ignored (empty or placeholder).')
+
             _requests_session = session
         return _requests_session
 
@@ -195,6 +211,99 @@ def normalize_handicap_to_half_bucket_str(text: str):
         return None
     # Formato con un decimal
     return f"{b:.1f}"
+
+
+
+def _filter_matches_by_handicap(matches, handicap_filter):
+    if not handicap_filter:
+        return matches
+    try:
+        target = normalize_handicap_to_half_bucket_str(handicap_filter)
+    except Exception:
+        target = None
+    if target is None:
+        return matches
+    filtered = []
+    for match in matches:
+        try:
+            hv = normalize_handicap_to_half_bucket_str(match.get('handicap'))
+        except Exception:
+            hv = None
+        if hv == target:
+            filtered.append(match)
+    return filtered
+
+
+def parse_js_data(js_content: str):
+    matches_str = re.findall(r"A\[\d+\]=\[(.*?)\];", js_content)
+    if not matches_str:
+        print("[ERROR] No se encontro la estructura de datos 'A[i]=[...]' en el fichero JS.")
+        return []
+
+    upcoming_matches = []
+    now_utc = datetime.datetime.utcnow()
+
+    for raw_str in matches_str:
+        sanitized = raw_str.strip()
+        while ',,' in sanitized:
+            sanitized = sanitized.replace(',,', ',None,')
+        if sanitized.startswith(','):
+            sanitized = 'None' + sanitized
+        if sanitized.endswith(','):
+            sanitized = sanitized + 'None'
+
+        try:
+            match_tuple = eval(f"({sanitized})", {"__builtins__": {}, "None": None, "True": True, "False": False})
+        except Exception as exc:
+            print(f"[AVISO] Saltando fila con datos inesperados: {exc} -> {sanitized[:80]}...")
+            continue
+
+        try:
+            state = int(match_tuple[8])
+            if state != 0:
+                continue
+
+            match_id = match_tuple[0]
+            home_team = str(match_tuple[4]).strip()
+            away_team = str(match_tuple[5]).strip()
+            time_str = str(match_tuple[6]).strip()
+            if not all([match_id, home_team, away_team, time_str]):
+                continue
+
+            match_time_gmt8 = datetime.datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
+            match_time_utc = match_time_gmt8 - datetime.timedelta(hours=8)
+            if match_time_utc < now_utc:
+                continue
+
+            handicap = match_tuple[21] if len(match_tuple) > 21 else None
+            goal_line = match_tuple[25] if len(match_tuple) > 25 else None
+
+            handicap_str = '' if handicap is None else str(handicap).strip()
+            goal_line_str = '' if goal_line is None else str(goal_line).strip()
+
+            if not handicap_str or handicap_str in {'N/A', 'None'}:
+                continue
+            if not goal_line_str or goal_line_str in {'N/A', 'None'}:
+                continue
+
+            upcoming_matches.append({
+                'id': str(match_id),
+                'time_obj': match_time_utc,
+                'home_team': home_team,
+                'away_team': away_team,
+                'handicap': handicap_str,
+                'goal_line': goal_line_str
+            })
+        except (IndexError, ValueError, TypeError) as exc:
+            print(f"[AVISO] Error al procesar fila JS: {exc}")
+            continue
+
+    upcoming_matches.sort(key=lambda x: x['time_obj'])
+    for match in upcoming_matches:
+        match['time'] = (match['time_obj'] + datetime.timedelta(hours=2)).strftime('%H:%M')
+        del match['time_obj']
+
+    return upcoming_matches
 
 def parse_main_page_matches(html_content, limit=20, offset=0, handicap_filter=None):
     soup = BeautifulSoup(html_content, 'html.parser')
@@ -337,18 +446,36 @@ def parse_main_page_finished_matches(html_content, limit=20, offset=0, handicap_
     return paginated_matches
 
 async def get_main_page_matches_async(limit=20, offset=0, handicap_filter=None):
-    html_content = await _fetch_nowgoal_html(filter_state=3)
+    session = _get_shared_requests_session()
+    matches = []
+    try:
+        url = f"{DATA_JS_URL}?t={int(datetime.datetime.utcnow().timestamp())}"
+        response = await asyncio.to_thread(session.get, url, timeout=REQUEST_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        js_content = response.text
+        if js_content:
+            matches = parse_js_data(js_content)
+    except Exception as exc:
+        print(f"[ERROR] No se pudo obtener o procesar el fichero de datos JS: {exc}")
+        matches = []
+
+    if matches:
+        matches = _filter_matches_by_handicap(matches, handicap_filter)
+        return matches[offset:offset + limit]
+
+    print('[AVISO] Fallback a Playwright para cargar los partidos en vivo.')
+    html_content = await _fetch_nowgoal_html(filter_state=3, requests_first=False)
     if not html_content:
-        html_content = await _fetch_nowgoal_html(filter_state=3, requests_first=False)
-        if not html_content:
-            return []
+        return []
+
     matches = parse_main_page_matches(html_content, limit, offset, handicap_filter)
-    if not matches:
-        html_content = await _fetch_nowgoal_html(filter_state=3, requests_first=False)
-        if not html_content:
-            return []
-        matches = parse_main_page_matches(html_content, limit, offset, handicap_filter)
-    return matches
+    if matches:
+        return matches
+
+    html_content = await _fetch_nowgoal_html(filter_state=3, requests_first=False)
+    if not html_content:
+        return []
+    return parse_main_page_matches(html_content, limit, offset, handicap_filter)
 
 async def get_main_page_finished_matches_async(limit=20, offset=0, handicap_filter=None):
     html_content = await _fetch_nowgoal_html(path='football/results')
